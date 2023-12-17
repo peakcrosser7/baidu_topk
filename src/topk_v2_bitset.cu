@@ -2,16 +2,7 @@
 #include "topk.h"
 #include "thread_pool.h"
 
-#include <cub/cub.cuh>
-#include <cuda_fp16.hpp>
 #include <chrono>
-#include <numeric>
-#include <cuda_pipeline.h>
-
-#include <emmintrin.h>
-#include <mmintrin.h>
-
-#include "fast_topk.cuh"
 
 typedef uint4 group_t;
 
@@ -19,18 +10,16 @@ constexpr static const int TOPK = 100;
 constexpr static const int N_THREADS_IN_ONE_BLOCK = 512;
 constexpr static const int MAX_DOC_SIZE = 128;
 
-constexpr static const int max_batch = 4;
 // constexpr static const int max_id = 50000;
 constexpr static const int query_mask_size = 1568;  // 1568 * 32 > 50000
-constexpr static const int default_sort_storage = 64 * 1024 * 1024;
-constexpr static const int num_threads = 8;
+constexpr static const int NUM_THREADS = 8;
 
 void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
         const uint16_t *docs, 
         const int *doc_lens,
         const size_t n_docs, 
-        uint32_t *query,
-        const uint16_t max_query_token,
+        uint32_t *query,    // bitmap存储
+        const uint16_t max_query_token, // query中最大数字
         const int query_len,
         float *scores) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -40,9 +29,12 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
 
     #pragma unroll
     for (int l = threadid; l < query_mask_size; l += N_THREADS_IN_ONE_BLOCK) {
+        // 加载全局内存数据 与直接加载相比,__ldg()在读取频繁只读数据时会稍快
         query_mask[l] = __ldg(query + l);
     }
     __syncthreads();
+
+    // 去掉了 for doc_id 循环,因为根据grid的计算,实际上只会循环1次
 
     if (tid >= n_docs) {
         return;
@@ -50,23 +42,25 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
 
     int doc_id = tid;
     int doc_len = doc_lens[doc_id];
-    int loop = (doc_len + 7) / 8;
+    int loop = (doc_len + 7) / 8;   // 根据doc长度决定外层循环次数
 
     uint16_t tmp_score = 0;
 
     for (int i = 0; i < loop; ++i) {
         group_t loaded = ((group_t*)docs)[i * n_docs + doc_id];
-        uint16_t* token = (uint16_t*)(&loaded);
+        uint16_t* token = (uint16_t*)(&loaded); // i.e. doc_segment
 
         #pragma unroll
-        for (auto j = 0; j < 8; ++j) {
+        for (auto j = 0; j < 8; ++j) {  // sizeof(group_t)/sizeof(uint16_t)
             uint16_t tindex = token[j] >> 5;
             uint16_t tpos = token[j] & 31;
 
+            // 使用bitmap求交集
             tmp_score += (query_mask[tindex] >> tpos) & 0x01;
             // tmp_score += __popc(query_mask[tindex] & tmask);
         }
 
+        // 提前退出
         if (token[7] >= max_query_token) {
             break;
         }
@@ -74,7 +68,7 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
     scores[doc_id] = 1.f * tmp_score / max(query_len, doc_len);
 }
 
-#define MYTIME
+// #define MYTIME
 
 #ifdef MYTIME
 struct Timer {
@@ -189,6 +183,7 @@ struct TopkTask : public Task {
 
             const size_t query_len = query.size();
             std::vector<uint32_t> query_mask(query_mask_size, 0u);
+            // 将query用bitmap存储
             for (auto& q : query) {
                 int index = q / 32;
                 int postion = q % 32;
@@ -247,11 +242,11 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
     float *d_scores = nullptr;
     uint16_t *d_docs = nullptr;
-    uint32_t *d_query = nullptr;
+    // uint32_t *d_query = nullptr;
     int *d_doc_lens = nullptr;
 
     ThreadPool pool;
-    int num_threads = min(8, static_cast<int>(n_docs));
+    int num_threads = min(NUM_THREADS, static_cast<int>(n_docs));
     pool.set_num_threads(num_threads);
 
 Timer t("pre_process");

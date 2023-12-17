@@ -1,17 +1,11 @@
 
 #include "topk.h"
 #include "thread_pool.h"
+#include "fast_topk.cuh"
 
-#include <cub/cub.cuh>
-#include <cuda_fp16.hpp>
 #include <chrono>
 #include <numeric>
-#include <cuda_pipeline.h>
-
 #include <emmintrin.h>
-#include <mmintrin.h>
-
-#include "fast_topk.cuh"
 
 typedef uint4 group_t;
 constexpr static const int TOPK = 100;
@@ -19,7 +13,7 @@ constexpr static const int N_THREADS_IN_ONE_BLOCK = 512;
 constexpr static const int MAX_DOC_SIZE = 128;
 
 constexpr static const int max_batch = 4;
-constexpr static const int max_id = 50000;
+// constexpr static const int max_id = 50000;
 constexpr static const int query_mask_size = 1568;  // 1568 * 32 > 50000
 constexpr static const int default_sort_storage = 64 * 1024 * 1024;
 constexpr static const int num_threads = 8;
@@ -55,9 +49,9 @@ __launch_bounds__(N_THREADS_IN_ONE_BLOCK, 4)
 void __global__ docFirstKernel(
         const uint16_t* docs,
         const uint16_t* doc_lens,
-        const int doc_offset,
-        const int doc_num, 
-        const int n_docs,
+        const int doc_offset,   // 处理的docs起始偏移
+        const int doc_num,      // 处理的docs数量
+        const int n_docs,       // 总docs数量
         const uint32_t* query,
         const int query_len,
         const uint16_t max_query_token,
@@ -77,6 +71,8 @@ void __global__ docFirstKernel(
         return;
     }
 
+    // 与之前docQueryScoringCoalescedMemoryAccessSampleKernel()的区别
+    // 即此处doc_id是从起始偏移开始处理doc_num个
     int doc_id = doc_offset + tid;
     int doc_len = doc_lens[doc_id];
     int loop = (doc_len + 7) / 8;
@@ -103,6 +99,7 @@ void __global__ docFirstKernel(
     scores[tid] = static_cast<int16_t>(1.f * 128 * 128 * tmp_score / max(query_len, doc_len));
 }
 
+/// 两侧搜索范围docs求交集
 #if __CUDA_ARCH__ == 860
 __launch_bounds__(N_THREADS_IN_ONE_BLOCK, 3)
 #elif __CUDA_ARCH__ == 800
@@ -111,15 +108,15 @@ __launch_bounds__(N_THREADS_IN_ONE_BLOCK, 4)
 void __global__ docIterKernel(
         const uint16_t* docs,
         const uint16_t* doc_lens,
-        const int doc_offset1,
-        const int doc_num1,
-        const int doc_offset2,
-        const int doc_num2,
+        const int doc_offset1,  // 左侧待处理docs的起始偏移
+        const int doc_num1,     // 左侧待处理docs的数量
+        const int doc_offset2,  // 右侧待处理docs的起始偏移
+        const int doc_num2,     // 右侧待处理docs的数量
         const int n_docs,
         const uint32_t* query,
         const int query_len,
         const uint16_t max_query_token,
-        const float thresh,
+        const float thresh,     // 当前分数阈值
         int16_t *scores) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int threadid = threadIdx.x;
@@ -138,6 +135,7 @@ void __global__ docIterKernel(
 
     int doc_id = tid < doc_num1 ? (doc_offset1 + tid) : (doc_offset2 + tid - doc_num1);
     int doc_len = doc_lens[doc_id];
+    // 当前doc匹配个数下限阈值 即要达到thresh该doc至少要与query匹配的元素个数
     uint32_t tmp_score_thresh = static_cast<uint32_t>(max(doc_len, query_len) * thresh);
     int loop = (doc_len + 7) / 8;
 
@@ -157,6 +155,7 @@ void __global__ docIterKernel(
             tmp_score += __popc(query_mask[tindex] & tmask);
         }
         if (token[7] > max_query_token 
+                   // 当前匹配个数的前提下,即使后续全部元素都匹配也小于当前doc要满足的匹配下限时,退出计算
                 || tmp_score + (doc_len - (i + 1) * 8) < tmp_score_thresh) {
             break;
         }
@@ -165,7 +164,7 @@ void __global__ docIterKernel(
 }
 
 
-#define MYTIME
+// #define MYTIME
 
 #ifdef MYTIME
 struct Timer {
@@ -213,7 +212,7 @@ struct Context {
 t.stop("cuda_malloc_device");
         // 计算好需要分配的显存大小
         size_t bytes = 0u;
-        bytes += align_bytes(sizeof(uint16_t) * 128 * n_docs);                      // d_docs
+        bytes += align_bytes(sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);                      // d_docs
         bytes += align_bytes(sizeof(uint16_t) * n_docs);                            // d_doc_lens
         for (int i = 0; i < num_threads; ++i) {
             bytes += align_bytes(sizeof(half) * max_batch * n_docs);                // d_scores
@@ -238,7 +237,7 @@ t.stop("cuda_malloc_pinned");
         CHECK_CUDA(cudaMallocHost(&h_pinned_mem, bytes));
 
 t.stop("cuda_malloc_host");
-        auto ret = posix_memalign((void**)(&h_mem), 256, sizeof(uint16_t) * 128 * n_docs);
+        auto ret = posix_memalign((void**)(&h_mem), 256, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);
         (void)(ret);
 
         int8_t* h_mem_pool = h_mem;
@@ -246,10 +245,10 @@ t.stop("cuda_malloc_host");
         int8_t* d_mem_pool = d_mem;
         // 初始化指针
         h_docs = reinterpret_cast<uint16_t*>(h_mem_pool);
-        h_mem_pool += align_bytes(sizeof(uint16_t) * 128 * n_docs);
+        h_mem_pool += align_bytes(sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);
 
         d_docs = reinterpret_cast<uint16_t*>(d_mem_pool);
-        d_mem_pool += align_bytes(sizeof(uint16_t) * 128 * n_docs);
+        d_mem_pool += align_bytes(sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);
         d_doc_lens = reinterpret_cast<uint16_t*>(d_mem_pool);
         d_mem_pool += align_bytes(sizeof(uint16_t) * n_docs);
 
@@ -356,6 +355,7 @@ void search_topk(
             cudaMemcpyHostToDevice, stream));
     int query_len = query.size();
 
+    // 极端特例判断
     // 如果 query 长度为 0 直接返回前 TOPK 个 doc
     if (query_len == 0) {
         std::vector<int> s_ans(TOPK);
@@ -370,16 +370,18 @@ void search_topk(
     int cur_doc_len_end = 0;
     Pair* cur_topk = h_topk;
     {
-        // step1, 先查询长度在 [query_len - 2, query_len + 4] 内的所有 query
-        int doc_len_end = std::min(129, query_len + 1 + 2 * window);
+        // step1, 先查询长度在 [query_len - window, query_len + 2*window] 内的所有 query
+        // 在该范围的原因:与query长度最接近的doc交集计算可以得到最高的得分
+        int doc_len_end = std::min(MAX_DOC_SIZE + 1, query_len + 1 + 2 * window);
         int doc_len_start = std::max(0, doc_len_end - (1 + 3 * window));
-        doc_len_end = std::min(129, doc_len_start + (1 + 3 * window));
+        doc_len_end = std::min(MAX_DOC_SIZE + 1, doc_len_start + (1 + 3 * window));
 
+        // 获取该部分的doc数量
         int doc_num = doc_stat_offset[doc_len_end] - doc_stat_offset[doc_len_start];
         while (doc_num < TOPK) {
             // 如果所选范围内 doc 数不足 TOPK 个则继续扩大范围
             doc_len_start = std::max(0, doc_len_start - 1);
-            doc_len_end = std::min(129, doc_len_end + 1);
+            doc_len_end = std::min(MAX_DOC_SIZE + 1, doc_len_end + 1);
             doc_num = doc_stat_offset[doc_len_end] - doc_stat_offset[doc_len_start];
         }
         int doc_offset = doc_stat_offset[doc_len_start];
@@ -398,6 +400,7 @@ void search_topk(
         CHECK_CUDA(cudaStreamSynchronize(stream));
         // Pair* cur_topk = h_topk;
 
+        // 对所有结果+doc_offset得到实际在doc中的索引
         for (int k = 0; k < TOPK; ++k) {
             cur_topk[k].index += doc_offset;
         }
@@ -410,12 +413,18 @@ void search_topk(
                     return a.index < b.index;
                 });
 
+        // 将该部分搜索范围的最低分作为阈值thresh(此时/128/128恢复为原本的float分数)
         float score_thresh = cur_topk[TOPK - 1].score / 128 / 128;
         // printf("[F] %d %d %f\n", doc_len_start, doc_len_end, score_thresh);
+        
+        // 判断thresh覆盖范围是否全部计算
         bool finished = score_thresh > 0.f
+                // thresh覆盖范围左边界 >= 搜索范围左边界
                 && static_cast<int>(query_len * score_thresh) >= doc_len_start
-                && std::min(128, static_cast<int>(query_len / score_thresh)) < doc_len_end;
-        finished = finished || (doc_len_start == 0 && doc_len_end == 129);
+                // thresh覆盖范围右边界 < 搜索范围右边界(不包括)
+                && std::min(MAX_DOC_SIZE, static_cast<int>(query_len / score_thresh)) < doc_len_end;
+        // 搜索范围已包括全部docs长度则同样计算完成
+        finished = finished || (doc_len_start == 0 && doc_len_end == MAX_DOC_SIZE + 1);
         if (finished) {
             // 已经找到正确的 TOPK, 提前返回
             std::vector<int> s_ans(TOPK);
@@ -429,6 +438,7 @@ void search_topk(
         cur_doc_len_end = doc_len_end;
         cur_doc_len_start = doc_len_start;
         cur_score_thresh = score_thresh;
+        // 窗口扩大两倍
         window *= 2;
     }
 
@@ -438,18 +448,22 @@ void search_topk(
         int doc_len_end = 0;
         if (cur_score_thresh == 0.f) {
             doc_len_start = 0;
-            doc_len_end = 129;
+            doc_len_end = MAX_DOC_SIZE + 1;
         } else {
             int min_start = static_cast<int>(query_len * cur_score_thresh);
-            int max_end = std::min(129, static_cast<int>(query_len / cur_score_thresh + 1));
+            int max_end = std::min(MAX_DOC_SIZE + 1, static_cast<int>(query_len / cur_score_thresh + 1));
+            // doc_len_start大小关系:
+            // 最小: max(thresh搜索范围左边界,window搜索范围左边界), 前者保证最小的搜索范围, 后者是避免搜索范围超过window
             doc_len_start = std::max(min_start, cur_doc_len_start - window);
+            // 最大: 比之前搜索范围左边界要小
             doc_len_start = std::min(doc_len_start, cur_doc_len_start);
+            // doc_len_end大小关系同理
             doc_len_end = std::min(max_end, cur_doc_len_end + window * 2);
             doc_len_end = std::max(doc_len_end, cur_doc_len_end);
 
             // 对 doc_len_end == 128 的特殊处理, 防止因没有 doc 长度为 128 而陷入循环
-            if (doc_len_end == 128 && (doc_stat_offset[129] - doc_stat_offset[128] == 0)) {
-                doc_len_end = 129;
+            if (doc_len_end == MAX_DOC_SIZE && (doc_stat_offset[MAX_DOC_SIZE + 1] - doc_stat_offset[MAX_DOC_SIZE] == 0)) {
+                doc_len_end = MAX_DOC_SIZE + 1;
             }
         }
 
@@ -475,14 +489,17 @@ void search_topk(
                 cur_score_thresh, d_scores);
         CHECK_CUDA(cudaGetLastError());
 
+        // 新搜索范围中的topk doc数
         int new_topk = std::min(doc_num, TOPK);
         launch_gather_topk_kernel(
                 d_scores, d_topk, (int8_t*)d_temp_storage, new_topk, 1, doc_num, stream);
+        // 拷贝位置为h_topk + TOPK是让h_topk前TOPK个元素记录最后结果
         CHECK_CUDA(cudaMemcpyAsync(h_topk + TOPK, d_topk, new_topk * sizeof(Pair), cudaMemcpyDeviceToHost, stream));
 
         CHECK_CUDA(cudaStreamSynchronize(stream));
         Pair* topk = h_topk + TOPK;
 
+        // 恢复为原docs中的索引
         for (int k = 0; k < new_topk; ++k) {
             if (topk[k].index < doc_num1) {
                 topk[k].index += doc_offset1;
@@ -503,8 +520,9 @@ void search_topk(
         Pair* temp = h_topk + TOPK * 2;
         int pre_index = 0;
         int new_index = 0;
+        // 对topk(新结果)和cur_topk(旧结果)两个有序数组进行最长TOPK大小的双指针归并
         for (int k = 0; k < TOPK; ++k) {
-            if (new_index == new_topk
+            if (new_index == new_topk   // new_topk可能小于topk,因此新得到的new_topk个结果可能先排完,将原topk的尾部追加到合并数组中
                 || cur_topk[pre_index].score > topk[new_index].score
                 || (cur_topk[pre_index].score == topk[new_index].score
                     && cur_topk[pre_index].index < topk[new_index].index)) {
@@ -517,8 +535,10 @@ void search_topk(
                 ++new_index;
             }
         }
+        // 将合并结果拷贝到最终结果中
         memcpy(cur_topk, temp, sizeof(Pair) * TOPK);
 
+        // 计算当前TOPK结果的阈值thresh和是否计算完成
         float score_thresh = cur_topk[TOPK - 1].score / 128 / 128;
         bool finished = score_thresh > 0.f
                 && static_cast<int>(query_len * score_thresh) >= doc_len_start
@@ -539,6 +559,9 @@ void search_topk(
         cur_score_thresh = score_thresh;
 
         // 下一次搜索时扩大搜索窗口, 继续搜索
+        // 窗口指数增长的原因:
+        // 随着计算,剩余的元素越来越少,可能符合要求的潜在doc变得更少
+        // 为了尽快收敛,让后续的搜索范围尽可能变大
         window *= 2;
     }
 }
@@ -640,10 +663,10 @@ struct TopkTask : public Task {
             std::vector<std::vector<int>> &indices_)
         : ctx(ctx_),
           id(id_),
-          world(world_),
+          world(world_),    // 总线程数
           start(start_),
           end(end_),
-          doc_stat_offset(doc_stat_offset_),
+          doc_stat_offset(doc_stat_offset_),    // docs长度统计偏移
           querys(querys_),
           query_idx(query_idx_),
           d_docs(d_docs_),
@@ -673,6 +696,7 @@ struct TopkTask : public Task {
         // for (int i = max_batch * id; i < total_items; i += max_batch * world) {
         //     int cur_batch = std::min<int>(total_items - i, max_batch);
 
+        // 该版本没有对query分批次,而是单query处理
         for (int i = id; i < total_items; i += world) {
             search_topk(
                 n_docs_pad,
@@ -720,6 +744,7 @@ Timer t("pre_malloc_host");
 
     // 分配资源，包括显存、内存、流、线程池等
     Context ctx;
+    // 该版本中ctx.init_pinned()函数被合并到ctx.init()函数中
     ctx.init(n_docs_pad, num_threads);
 
     uint16_t* h_docs = ctx.h_docs;
@@ -743,10 +768,12 @@ t.stop("pre_thread_pool");
 
     // 线程池在处理 d_docs 时, 主线程处理其他耗时的操作
 t.stop("pre_query_stat");
+    // 统计docs的长度分布
     int doc_stat[129] = {0};
     for (int i = 0; i < lens.size(); ++i) {
         doc_stat[lens[i]]++;
     }
+    // docs长度偏移
     std::vector<int> doc_stat_offset(130, 0);
     for (int i = 0; i < 129; ++i) {
         doc_stat_offset[i + 1] = doc_stat_offset[i] + doc_stat[i];
@@ -777,58 +804,58 @@ t.stop("pre_memcpy_device");
     pool.wait();
 
 t.stop("topk");
-    if (false) {
-    // if (true) {
-        Context::ThreadContext& tctx = ctx.thread_contexts[0];
-        int16_t* d_scores = tctx.d_scores;
-        Pair* d_topk = tctx.d_topk;
-        uint32_t* d_query = tctx.d_query;
-        uint16_t* d_query_len = tctx.d_query_len;
-        void* d_temp_storage = tctx.d_temp_storage;
+#if  0 
+    Context::ThreadContext& tctx = ctx.thread_contexts[0];
+    int16_t* d_scores = tctx.d_scores;
+    Pair* d_topk = tctx.d_topk;
+    uint32_t* d_query = tctx.d_query;
+    uint16_t* d_query_len = tctx.d_query_len;
+    void* d_temp_storage = tctx.d_temp_storage;
 
-        Pair* h_topk = tctx.h_topk;
-        uint32_t* h_query = tctx.h_query;
-        uint16_t* h_query_len = tctx.h_query_len;
+    Pair* h_topk = tctx.h_topk;
+    uint32_t* h_query = tctx.h_query;
+    uint16_t* h_query_len = tctx.h_query_len;
 
-        indices.resize(querys.size());
+    indices.resize(querys.size());
 
-        for (int i = 0; i < querys.size(); ++i) {
+    for (int i = 0; i < querys.size(); ++i) {
 // Timer tt("query");
-            search_topk(
-                n_docs_pad,
-                d_docs,
-                d_doc_lens,
-                d_scores,
-                d_topk,
-                d_query,
-                d_query_len,
-                d_temp_storage,
-                h_topk,
-                h_query,
-                h_query_len,
-                doc_stat_offset,
-                querys,
-                indices,
-                i,
-                stream);
+        search_topk(
+            n_docs_pad,
+            d_docs,
+            d_doc_lens,
+            d_scores,
+            d_topk,
+            d_query,
+            d_query_len,
+            d_temp_storage,
+            h_topk,
+            h_query,
+            h_query_len,
+            doc_stat_offset,
+            querys,
+            indices,
+            i,
+            stream);
 // tt.stop();
-        }
-    } else {
-        indices.resize(querys.size());
-        std::vector<Task*> topk_tasks(num_threads);
-        int num_querys = querys.size();
-        int n_query_per_threads = (num_querys + num_threads - 1) / num_threads;
-        int start = 0;
-        for (int i = 0; i < num_threads; ++i) {
-            int size = min(n_query_per_threads, num_querys - start);
-            int end = start + size;
-            topk_tasks[i] = new TopkTask(
-                    ctx, i, num_threads, start, end, doc_stat_offset,
-                    querys, query_idx, d_docs, d_doc_lens, n_docs_pad, indices);
-            start = end;
-        }
-        pool.run_task(topk_tasks);
-        pool.wait();
     }
+#else
+    indices.resize(querys.size());
+    std::vector<Task*> topk_tasks(num_threads);
+    int num_querys = querys.size();
+    int n_query_per_threads = (num_querys + num_threads - 1) / num_threads;
+    int start = 0;
+    for (int i = 0; i < num_threads; ++i) {
+        int size = min(n_query_per_threads, num_querys - start);
+        int end = start + size;
+        topk_tasks[i] = new TopkTask(
+                ctx, i, num_threads, start, end, doc_stat_offset,
+                querys, query_idx, d_docs, d_doc_lens, n_docs_pad, indices);
+        start = end;
+    }
+    pool.run_task(topk_tasks);
+    pool.wait();
+#endif
+
 t.stop();
 }

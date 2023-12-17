@@ -1,6 +1,7 @@
+// Reference: https://github.com/pytorch/pytorch/blob/main/aten/src/ATen/native/cuda/TensorTopK.cu
+
 #include <cub/cub.cuh>
 #include <cub/version.cuh>
-#include <cuda_fp16.hpp>
 
 #if CUB_VERSION < 101500
 #include "cub_scan_by_key.cuh"
@@ -21,6 +22,8 @@ struct Pair {
     int index;
 };
 
+/// @brief 256字节对齐
+/// @return 大于等于a的最小256倍数
 inline size_t align_bytes(size_t a) {
     return (a + 255) / 256 * 256;
 }

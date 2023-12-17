@@ -2,16 +2,7 @@
 #include "topk.h"
 #include "thread_pool.h"
 
-#include <cub/cub.cuh>
-#include <cuda_fp16.hpp>
 #include <chrono>
-#include <numeric>
-#include <cuda_pipeline.h>
-
-#include <emmintrin.h>
-#include <mmintrin.h>
-
-#include "fast_topk.cuh"
 
 typedef uint4 group_t;
 
@@ -19,11 +10,7 @@ constexpr static const int TOPK = 100;
 constexpr static const int N_THREADS_IN_ONE_BLOCK = 512;
 constexpr static const int MAX_DOC_SIZE = 128;
 
-constexpr static const int max_batch = 4;
-// constexpr static const int max_id = 50000;
-constexpr static const int query_mask_size = 1568;  // 1568 * 32 > 50000
-constexpr static const int default_sort_storage = 64 * 1024 * 1024;
-constexpr static const int num_threads = 8;
+constexpr static const int NUM_THREADS = 8;
 
 void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
         const __restrict__ uint16_t *docs, 
@@ -76,7 +63,7 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
     }
 }
 
-#define MYTIME
+// #define MYTIME
 
 #ifdef MYTIME
 struct Timer {
@@ -106,6 +93,7 @@ struct Timer {
 };
 #endif
 
+/// @brief 执行内存初始化任务
 struct MemsetTask : public Task {
     MemsetTask(uint16_t* ptr, size_t size)
         : m_ptr(ptr), m_size(size) 
@@ -119,7 +107,14 @@ struct MemsetTask : public Task {
     size_t m_size = 0;
 };
 
+/// @brief 执行docs的swizzle任务
 struct HostCopyTask : public Task {
+
+    /// @param start docs起始位置
+    /// @param end docs结束位置
+    /// @param h_doc_lens_vec docs长度数组
+    /// @param h_docs swizzle后docs数组
+    /// @param docs 原docs数组
     HostCopyTask(int start, int end, std::vector<int>& h_doc_lens_vec, uint16_t* h_docs, std::vector<std::vector<uint16_t>> & docs)
         : m_start(start), m_end(end), m_h_doc_lens(h_doc_lens_vec), m_h_docs(h_docs), m_docs(docs)
     {}
@@ -151,6 +146,13 @@ struct HostCopyTask : public Task {
 
 struct TopkTask : public Task {
 
+    /// @param start 起始query
+    /// @param end 终止query
+    /// @param querys query数组
+    /// @param d_docs docs数组
+    /// @param d_doc_lens docs长度数组
+    /// @param n_docs docs数量
+    /// @param indices Topk结果索引数组
     TopkTask(int start, int end, std::vector<std::vector<uint16_t>> &querys,
             uint16_t *d_docs, int *d_doc_lens, int n_docs, std::vector<std::vector<int>> &indices)
         : m_start(start), m_end(end), m_querys(querys), m_d_docs(d_docs), m_d_doc_lens(d_doc_lens),
@@ -165,13 +167,17 @@ struct TopkTask : public Task {
         cudaGetDeviceProperties(&device_props, 0);
         cudaSetDevice(0);
 
+        // 每个Worker线程对应一个stream
         cudaStream_t stream;
+        // 无需与stream0同步
         cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        // cudaStreamCreate(&stream);
         uint16_t* d_query;
         cudaMallocAsync(&d_query, sizeof(uint16_t) * 128, stream);
         float* d_scores;
         cudaMallocAsync(&d_scores, sizeof(float) * m_n_docs, stream);
 
+        // 初始化顺序索引(用于后续直接拷贝)
         std::vector<int> indices(m_n_docs);
         for (int i = 0; i < m_n_docs; ++i) {
             indices[i] = i;
@@ -184,6 +190,7 @@ struct TopkTask : public Task {
         std::vector<int> s_indices(m_n_docs);
         std::vector<float> scores(m_n_docs);
 
+        // 遍历每个query执行求交集+topk
         for (int i = m_start; i < m_end; ++i) {
             auto& query = m_querys[i];
             //init indices
@@ -241,11 +248,11 @@ void doc_query_scoring_gpu_function(std::vector<std::vector<uint16_t>> &querys,
 
     float *d_scores = nullptr;
     uint16_t *d_docs = nullptr;
-    uint16_t *d_query = nullptr;
+    // uint16_t *d_query = nullptr;
     int *d_doc_lens = nullptr;
 
     ThreadPool pool;
-    int num_threads = min(8, static_cast<int>(n_docs));
+    int num_threads = min(NUM_THREADS, static_cast<int>(n_docs));
     pool.set_num_threads(num_threads);
 
 Timer t("pre_process");
@@ -259,6 +266,7 @@ Timer t("pre_process");
 #if 0
     memset(h_docs, 0, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);
 #else
+    // 多线程执行内存初始化
     std::vector<Task*> tasks(num_threads, nullptr);
     size_t n_docs_per_threads = (n_docs + num_threads - 1) / num_threads;
     int offset = 0;
@@ -273,6 +281,7 @@ Timer t("pre_process");
 
     std::vector<int> h_doc_lens_vec(n_docs);
 #if 1
+    // 多线程执行内存swizzle
     std::vector<Task*> host_copy_tasks(num_threads, nullptr);
     // size_t n_docs_per_threads = (n_docs + num_threads - 1) / num_threads;
     offset = 0;
@@ -344,6 +353,7 @@ t.stop("topk");
         cudaFree(d_query);
     }
 #else
+    // 多线程执行求交集+Topk计算,每个线程负责部分query
     indices.resize(querys.size());
     std::vector<Task*> topk_tasks(num_threads, nullptr);
     int num_querys = querys.size();

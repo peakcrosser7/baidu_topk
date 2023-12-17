@@ -1,17 +1,15 @@
 
+// v10 与 v6 实现基本一致, 区别在 
+// v10 是使用 ctx.init() 和 ctx.init_cuda() 进行初始化,
+// 而 v6 是使用 ctx.init() 和 ctx.init_pinned() 进行初始化
+
 #include "topk.h"
 #include "thread_pool.h"
+#include "fast_topk.cuh"
 
-#include <cub/cub.cuh>
-#include <cuda_fp16.hpp>
 #include <chrono>
 #include <numeric>
-#include <cuda_pipeline.h>
-
 #include <emmintrin.h>
-#include <mmintrin.h>
-
-#include "fast_topk.cuh"
 
 typedef uint4 group_t;
 constexpr static const int TOPK = 100;
@@ -19,7 +17,7 @@ constexpr static const int N_THREADS_IN_ONE_BLOCK = 512;
 constexpr static const int MAX_DOC_SIZE = 128;
 
 constexpr static const int max_batch = 4;
-constexpr static const int max_id = 50000;
+// constexpr static const int max_id = 50000;
 constexpr static const int query_mask_size = 1568;  // 1568 * 32 > 50000
 constexpr static const int default_sort_storage = 64 * 1024 * 1024;
 constexpr static const int num_threads = 8;
@@ -214,7 +212,7 @@ void search_topk(
     }
 }
 
-#define MYTIME
+// #define MYTIME
 
 #ifdef MYTIME
 struct Timer {
@@ -253,7 +251,7 @@ Timer t("init");
         thread_contexts.resize(num_threads);
 
 t.stop("cuda_malloc_host");
-        auto ret = posix_memalign((void**)(&h_mem), 256, sizeof(uint16_t) * 128 * n_docs);
+        auto ret = posix_memalign((void**)(&h_mem), 256, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);
         (void)(ret);
 
         // 初始化指针
@@ -276,7 +274,7 @@ Timer t("cuda_init");
 t.stop("cuda_malloc_device");
         // 计算好需要分配的显存大小
         size_t bytes = 0u;
-        bytes += align_bytes(sizeof(uint16_t) * 128 * n_docs);                      // d_docs
+        bytes += align_bytes(sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);                      // d_docs
         bytes += align_bytes(sizeof(uint16_t) * n_docs);                            // d_doc_lens
         for (int i = 0; i < num_threads; ++i) {
             bytes += align_bytes(sizeof(half) * max_batch * n_docs);                // d_scores
@@ -289,7 +287,7 @@ t.stop("cuda_malloc_device");
         int8_t* d_mem_pool = d_mem;
 
         d_docs = reinterpret_cast<uint16_t*>(d_mem_pool);
-        d_mem_pool += align_bytes(sizeof(uint16_t) * 128 * n_docs);
+        d_mem_pool += align_bytes(sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);
 
         // 通知拷贝线程, d_docs 已经就绪了，可以开始拷贝了
         cuda_inited = true;
@@ -582,10 +580,12 @@ t.stop("pre_thread_pool");
     }
     pool.run_task(tasks);
 
+t.stop("pre_init_cuda");
+    // topk 计算需要的 cuda 资源 在此处分配
     ctx.init_cuda(n_docs_pad, num_threads);
 
     // 线程池在处理 d_docs 时, 主线程处理其他耗时的操作
-t.stop("pre_init_cuda");
+t.stop("pre_query_stat");
 
     std::vector<int> query_idx(querys.size());
     std::iota(query_idx.begin(), query_idx.end(), 0);
@@ -612,59 +612,59 @@ t.stop("pre_memcpy_device");
     // 等待线程池完成 docs-> h_docs -> d_docs 的任务
     pool.wait();
 t.stop("topk");
-    // if (false) {
-    if (true) {
-        // 单线程处理 query
-        Context::ThreadContext& tctx = ctx.thread_contexts[0];
-        int16_t* d_scores = tctx.d_scores;
-        Pair* d_topk = tctx.d_topk;
-        uint32_t* d_query = tctx.d_query;
-        uint16_t* d_query_len = tctx.d_query_len;
-        void* d_temp_storage = tctx.d_temp_storage;
+#if  1
+    // 单线程处理 query
+    Context::ThreadContext& tctx = ctx.thread_contexts[0];
+    int16_t* d_scores = tctx.d_scores;
+    Pair* d_topk = tctx.d_topk;
+    uint32_t* d_query = tctx.d_query;
+    uint16_t* d_query_len = tctx.d_query_len;
+    void* d_temp_storage = tctx.d_temp_storage;
 
-        Pair* h_topk = tctx.h_topk;
-        uint32_t* h_query = tctx.h_query;
-        uint16_t* h_query_len = tctx.h_query_len;
+    Pair* h_topk = tctx.h_topk;
+    uint32_t* h_query = tctx.h_query;
+    uint16_t* h_query_len = tctx.h_query_len;
 
-        for (int i = 0; i < querys.size(); i += max_batch) {
-            int cur_batch = std::min<int>(querys.size() - i, max_batch);
+    for (int i = 0; i < querys.size(); i += max_batch) {
+        int cur_batch = std::min<int>(querys.size() - i, max_batch);
 
 // Timer tt("query");
-            search_topk(n_docs_pad,
-                        d_docs,
-                        d_doc_lens,
-                        d_scores,
-                        d_topk,
-                        d_query,
-                        d_query_len,
-                        d_temp_storage,
-                        h_topk,
-                        h_query,
-                        h_query_len,
-                        query_idx,
-                        querys,
-                        indices,
-                        i,
-                        cur_batch,
-                        stream);
+        search_topk(n_docs_pad,
+                    d_docs,
+                    d_doc_lens,
+                    d_scores,
+                    d_topk,
+                    d_query,
+                    d_query_len,
+                    d_temp_storage,
+                    h_topk,
+                    h_query,
+                    h_query_len,
+                    query_idx,
+                    querys,
+                    indices,
+                    i,
+                    cur_batch,
+                    stream);
 // tt.stop();
-        }
-    } else {
-        // 多线程处理 query
-        std::vector<Task*> topk_tasks(num_threads);
-        int num_querys = querys.size();
-        int n_query_per_threads = (num_querys + num_threads - 1) / num_threads;
-        int start = 0;
-        for (int i = 0; i < num_threads; ++i) {
-            int size = min(n_query_per_threads, num_querys - start);
-            int end = start + size;
-            topk_tasks[i] = new TopkTask(
-                    ctx, i, num_threads, start, end, querys, query_idx, d_docs, d_doc_lens, n_docs_pad, indices);
-            start = end;
-        }
-
-        pool.run_task(topk_tasks);
-        pool.wait();
     }
+#else
+    // 多线程处理 query
+    std::vector<Task*> topk_tasks(num_threads);
+    int num_querys = querys.size();
+    int n_query_per_threads = (num_querys + num_threads - 1) / num_threads;
+    int start = 0;
+    for (int i = 0; i < num_threads; ++i) {
+        int size = min(n_query_per_threads, num_querys - start);
+        int end = start + size;
+        topk_tasks[i] = new TopkTask(
+                ctx, i, num_threads, start, end, querys, query_idx, d_docs, d_doc_lens, n_docs_pad, indices);
+        start = end;
+    }
+
+    pool.run_task(topk_tasks);
+    pool.wait();
+#endif
+
 t.stop();
 }

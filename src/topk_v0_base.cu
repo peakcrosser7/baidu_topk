@@ -1,29 +1,13 @@
 
 #include "topk.h"
-#include "thread_pool.h"
 
-#include <cub/cub.cuh>
-#include <cuda_fp16.hpp>
 #include <chrono>
-#include <numeric>
-#include <cuda_pipeline.h>
-
-#include <emmintrin.h>
-#include <mmintrin.h>
-
-#include "fast_topk.cuh"
 
 typedef uint4 group_t;
 
 constexpr static const int TOPK = 100;
 constexpr static const int N_THREADS_IN_ONE_BLOCK = 512;
 constexpr static const int MAX_DOC_SIZE = 128;
-
-constexpr static const int max_batch = 4;
-// constexpr static const int max_id = 50000;
-constexpr static const int query_mask_size = 1568;  // 1568 * 32 > 50000
-constexpr static const int default_sort_storage = 64 * 1024 * 1024;
-constexpr static const int num_threads = 8;
 
 void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
         const __restrict__ uint16_t *docs, 
@@ -76,7 +60,7 @@ void __global__ docQueryScoringCoalescedMemoryAccessSampleKernel(
     }
 }
 
-#define MYTIME
+// #define MYTIME
 
 #ifdef MYTIME
 struct Timer {

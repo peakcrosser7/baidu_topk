@@ -1,19 +1,11 @@
 
 #include "topk.h"
 #include "thread_pool.h"
+#include "fast_topk.cuh"
 
-#include <cub/cub.cuh>
-#include <cuda_fp16.hpp>
 #include <chrono>
 #include <numeric>
-#include <cuda_pipeline.h>
-
 #include <emmintrin.h>
-#include <mmintrin.h>
-#include <immintrin.h>
-#include <smmintrin.h>
-
-#include "fast_topk.cuh"
 
 typedef uint4 group_t;
 
@@ -921,67 +913,67 @@ t.stop("pre_malloc_device");
     indices.resize(querys.size());
 
 t.stop("pre_memcpy_device");
-
     // 等待线程池完成 docs-> h_docs -> d_docs 的任务
     pool.wait();
+
 t.stop("topk");
-    if (false) {
-    // if (true) {
-        // 单线程处理 query
-        Context::ThreadContext& tctx = ctx.thread_contexts[0];
-        int16_t* d_scores = tctx.d_scores;
-        Pair* d_topk = tctx.d_topk;
-        uint32_t* d_query = tctx.d_query;
-        uint16_t* d_query_len = tctx.d_query_len;
-        void* d_temp_storage = tctx.d_temp_storage;
+#if  0
+    // 单线程处理 query
+    Context::ThreadContext& tctx = ctx.thread_contexts[0];
+    int16_t* d_scores = tctx.d_scores;
+    Pair* d_topk = tctx.d_topk;
+    uint32_t* d_query = tctx.d_query;
+    uint16_t* d_query_len = tctx.d_query_len;
+    void* d_temp_storage = tctx.d_temp_storage;
 
-        Pair* h_topk = tctx.h_topk;
-        uint32_t* h_query = tctx.h_query;
-        uint16_t* h_query_len = tctx.h_query_len;
+    Pair* h_topk = tctx.h_topk;
+    uint32_t* h_query = tctx.h_query;
+    uint16_t* h_query_len = tctx.h_query_len;
 
-        for (int i = 0; i < querys.size(); i += max_batch) {
-            int cur_batch = std::min<int>(querys.size() - i, max_batch);
+    for (int i = 0; i < querys.size(); i += max_batch) {
+        int cur_batch = std::min<int>(querys.size() - i, max_batch);
 
 Timer tt("query");
-            search_topk(
-                    n_docs_pad,
-                    d_docs,
-                    d_doc_lens,
-                    d_scores,
-                    d_topk,
-                    d_query,
-                    d_query_len,
-                    d_temp_storage,
-                    h_topk,
-                    h_query,
-                    h_query_len,
-                    doc_stat_offset,
-                    querys,
-                    query_idx,
-                    indices,
-                    i,
-                    cur_batch,
-                    stream);
+        search_topk(
+                n_docs_pad,
+                d_docs,
+                d_doc_lens,
+                d_scores,
+                d_topk,
+                d_query,
+                d_query_len,
+                d_temp_storage,
+                h_topk,
+                h_query,
+                h_query_len,
+                doc_stat_offset,
+                querys,
+                query_idx,
+                indices,
+                i,
+                cur_batch,
+                stream);
 tt.stop();
-        }
-    } else {
-        // 多线程处理 query
-        std::vector<Task*> topk_tasks(num_threads);
-        int num_querys = querys.size();
-        int n_query_per_threads = (num_querys + num_threads - 1) / num_threads;
-        int start = 0;
-        for (int i = 0; i < num_threads; ++i) {
-            int size = min(n_query_per_threads, num_querys - start);
-            int end = start + size;
-            topk_tasks[i] = new TopkTask(
-                    ctx, i, num_threads, start, end,
-                    doc_stat_offset, querys, query_idx, d_docs, d_doc_lens,
-                    n_docs_pad, indices);
-            start = end;
-        }
-
-        pool.run_task(topk_tasks);
-        pool.wait();
     }
+#else
+    // 多线程处理 query
+    std::vector<Task*> topk_tasks(num_threads);
+    int num_querys = querys.size();
+    int n_query_per_threads = (num_querys + num_threads - 1) / num_threads;
+    int start = 0;
+    for (int i = 0; i < num_threads; ++i) {
+        int size = min(n_query_per_threads, num_querys - start);
+        int end = start + size;
+        topk_tasks[i] = new TopkTask(
+                ctx, i, num_threads, start, end,
+                doc_stat_offset, querys, query_idx, d_docs, d_doc_lens,
+                n_docs_pad, indices);
+        start = end;
+    }
+
+    pool.run_task(topk_tasks);
+    pool.wait();
+#endif
+
 t.stop();
 }

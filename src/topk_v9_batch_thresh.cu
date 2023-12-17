@@ -1,17 +1,11 @@
 
 #include "topk.h"
 #include "thread_pool.h"
+#include "fast_topk.cuh"
 
-#include <cub/cub.cuh>
-#include <cuda_fp16.hpp>
 #include <chrono>
 #include <numeric>
-#include <cuda_pipeline.h>
-
 #include <emmintrin.h>
-#include <mmintrin.h>
-
-#include "fast_topk.cuh"
 
 typedef uint4 group_t;
 
@@ -215,7 +209,7 @@ void search_topk(
         std::vector<int>& query_idx,
         std::vector<std::vector<int>> &indices,
         int start,
-        int batch,
+        int batch,  // 该批次需处理的query数
         cudaStream_t stream) {
 
     uint16_t max_query_len = 0;
@@ -279,11 +273,13 @@ void search_topk(
     Pair* cur_topk = h_topk;
     int cur_min_start = MAX_DOC_SIZE;
     int cur_max_end = 0;
+    // 记录未完成批次的topk计算结果的指针
     std::vector<Pair*> pre_topk_ptr(max_batch, nullptr);
 
     {
         // step1, 先查询长度在 [min_query_len - window, max_query_len + 2 * window] 内的所有 query
         // 查询范围为 [doc_len_start, doc_len_end), 包含 start, 不包含 end
+        // 注意与v8不同的是,这里是该批次的min_query_len和max_query_len来计算
         int doc_len_end = std::min(MAX_DOC_SIZE + 1, max_query_len + 1 + 2 * window);
         int doc_len_start = std::max(0, min_query_len - window);
 
@@ -291,7 +287,7 @@ void search_topk(
         while (doc_num < TOPK) {
             // 如果所选范围内 doc 数不足 TOPK 个则继续扩大范围
             doc_len_start = std::max(0, doc_len_start - 1);
-            doc_len_end = std::min(129, doc_len_end + 1);
+            doc_len_end = std::min(MAX_DOC_SIZE + 1, doc_len_end + 1);
             doc_num = doc_stat_offset[doc_len_end] - doc_stat_offset[doc_len_start];
         }
         int doc_offset = doc_stat_offset[doc_len_start];
@@ -338,8 +334,8 @@ void search_topk(
 
             bool finished = score_thresh > 0.f
                     && static_cast<int>(h_query_len[j] * score_thresh) >= doc_len_start
-                    && std::min(128, static_cast<int>(h_query_len[j] / score_thresh)) < doc_len_end;
-            finished = finished || (doc_len_start == 0 && doc_len_end == 129);
+                    && std::min(MAX_DOC_SIZE, static_cast<int>(h_query_len[j] / score_thresh)) < doc_len_end;
+            finished = finished || (doc_len_start == 0 && doc_len_end == MAX_DOC_SIZE + 1);
 
             int q_batch_index = unfinished_querys[j];
             if (finished) {
@@ -351,6 +347,7 @@ void search_topk(
                 indices[query_idx[start + q_batch_index]] = std::move(s_ans);
             } else {
                 step1_unfinished_querys.push_back(q_batch_index);
+                // 记录该批次topk结果的地址
                 pre_topk_ptr[q_batch_index] = topk;
 
                 // 统计所有 query 中 score 最小的那个作为 step2 的阈值
@@ -361,6 +358,9 @@ void search_topk(
                     cur_min_start = 0;
                     cur_max_end = MAX_DOC_SIZE + 1;
                 } else {
+                    // 此处与v8单query的thresh算法不同:
+                    // 单query是通过指数增加的window和当前thresh决定后续搜索范围
+                    // 此处多query是只通过批次中每个query当前thresh的对应的范围最大值和最小值决定后续搜索范围
                     int min_start = static_cast<int>(h_query_len[j] * score_thresh);
                     int max_end = std::min(MAX_DOC_SIZE + 1, static_cast<int>(h_query_len[j] / score_thresh + 1));
                     cur_min_start = std::min(cur_min_start, min_start);
@@ -381,6 +381,8 @@ void search_topk(
     }
 
     // step2, 剩余的 query 直接按照最大范围来搜索
+    // 即与v8不同的是,此处不再通过window逐步扩大范围,
+    // 而是直接按照thresh对应的搜索范围一次性完成搜索,得到最终的topk
     {
         int new_batch = unfinished_querys.size();
         if (cur_batch != new_batch) {
@@ -516,7 +518,7 @@ void search_topk(
     }
 }
 
-#define MYTIME
+// #define MYTIME
 
 #ifdef MYTIME
 struct Timer {
@@ -549,13 +551,14 @@ struct Timer {
 struct Context {
     Context() : cuda_inited(false) {}
 
+    /// @brief 仅完成h_docs内存分配
     void init(int n_docs, int num_threads) {
 Timer t("init");
         pool.set_num_threads(num_threads);
         thread_contexts.resize(num_threads);
 
 t.stop("cuda_malloc_host");
-        auto ret = posix_memalign((void**)(&h_mem), 256, sizeof(uint16_t) * 128 * n_docs);
+        auto ret = posix_memalign((void**)(&h_mem), 256, sizeof(uint16_t) * MAX_DOC_SIZE * n_docs);
         (void)(ret);
 
         // 初始化指针
@@ -566,6 +569,7 @@ t.stop("thread_pool");
 t.stop();
     }
 
+    /// @brief 负责显存分配,pinned内存分配,及设置显存指针和pinned内存指针
     void init_cuda(int n_docs, int num_threads) {
 Timer t("cuda_init");
         CHECK_CUDA(cudaSetDevice(0));
@@ -739,6 +743,7 @@ Timer t("host_copy");
         }
 t.stop("wait_cuda");
 
+        // 忙等待至CUDA初始化完成
         while (!ctx.cuda_inited.load()) {
             do_some_nops();
         }
@@ -817,6 +822,7 @@ struct TopkTask : public Task {
         uint16_t* h_query_len = tctx.h_query_len;
 
         int total_items = querys.size();
+        // 每个线程负责max_batch个query
         for (int i = max_batch * id; i < total_items; i += max_batch * world) {
             int cur_batch = std::min<int>(total_items - i, max_batch);
 
@@ -889,11 +895,13 @@ t.stop("pre_thread_pool");
     }
     pool.run_task(tasks);
 
+t.stop("pre_init_cuda");
     // topk 计算需要的 cuda 资源 在此处分配
     ctx.init_cuda(n_docs_pad, num_threads);
 
     // 线程池在处理 d_docs 时, 主线程处理其他耗时的操作
-t.stop("pre_init_cuda");
+t.stop("pre_query_stat");
+    // docs长度统计
     int doc_stat[129] = {0};
     for (int i = 0; i < lens.size(); ++i) {
         doc_stat[lens[i]]++;
@@ -912,6 +920,7 @@ t.stop("pre_init_cuda");
                 }
                 return querys[a].back() < querys[b].back();
             });
+
 t.stop("pre_malloc_device");
     cudaStream_t stream = ctx.stream;
     uint16_t* d_docs = ctx.d_docs;
@@ -926,67 +935,67 @@ t.stop("pre_malloc_device");
     indices.resize(querys.size());
 
 t.stop("pre_memcpy_device");
-
     // 等待线程池完成 docs-> h_docs -> d_docs 的任务
     pool.wait();
+
 t.stop("topk");
-    if (false) {
-    // if (true) {
-        // 单线程处理 query
-        Context::ThreadContext& tctx = ctx.thread_contexts[0];
-        int16_t* d_scores = tctx.d_scores;
-        Pair* d_topk = tctx.d_topk;
-        uint32_t* d_query = tctx.d_query;
-        uint16_t* d_query_len = tctx.d_query_len;
-        void* d_temp_storage = tctx.d_temp_storage;
+#if  0 
+    // 单线程处理 query
+    Context::ThreadContext& tctx = ctx.thread_contexts[0];
+    int16_t* d_scores = tctx.d_scores;
+    Pair* d_topk = tctx.d_topk;
+    uint32_t* d_query = tctx.d_query;
+    uint16_t* d_query_len = tctx.d_query_len;
+    void* d_temp_storage = tctx.d_temp_storage;
 
-        Pair* h_topk = tctx.h_topk;
-        uint32_t* h_query = tctx.h_query;
-        uint16_t* h_query_len = tctx.h_query_len;
+    Pair* h_topk = tctx.h_topk;
+    uint32_t* h_query = tctx.h_query;
+    uint16_t* h_query_len = tctx.h_query_len;
 
-        for (int i = 0; i < querys.size(); i += max_batch) {
-            int cur_batch = std::min<int>(querys.size() - i, max_batch);
+    for (int i = 0; i < querys.size(); i += max_batch) {
+        int cur_batch = std::min<int>(querys.size() - i, max_batch);
 
 Timer tt("query");
-            search_topk(
-                    n_docs_pad,
-                    d_docs,
-                    d_doc_lens,
-                    d_scores,
-                    d_topk,
-                    d_query,
-                    d_query_len,
-                    d_temp_storage,
-                    h_topk,
-                    h_query,
-                    h_query_len,
-                    doc_stat_offset,
-                    querys,
-                    query_idx,
-                    indices,
-                    i,
-                    cur_batch,
-                    stream);
+        search_topk(
+                n_docs_pad,
+                d_docs,
+                d_doc_lens,
+                d_scores,
+                d_topk,
+                d_query,
+                d_query_len,
+                d_temp_storage,
+                h_topk,
+                h_query,
+                h_query_len,
+                doc_stat_offset,
+                querys,
+                query_idx,
+                indices,
+                i,
+                cur_batch,
+                stream);
 tt.stop();
-        }
-    } else {
-        // 多线程处理 query
-        std::vector<Task*> topk_tasks(num_threads);
-        int num_querys = querys.size();
-        int n_query_per_threads = (num_querys + num_threads - 1) / num_threads;
-        int start = 0;
-        for (int i = 0; i < num_threads; ++i) {
-            int size = min(n_query_per_threads, num_querys - start);
-            int end = start + size;
-            topk_tasks[i] = new TopkTask(
-                    ctx, i, num_threads, start, end,
-                    doc_stat_offset, querys, query_idx, d_docs, d_doc_lens,
-                    n_docs_pad, indices);
-            start = end;
-        }
-
-        pool.run_task(topk_tasks);
-        pool.wait();
     }
+#else
+    // 多线程处理 query
+    std::vector<Task*> topk_tasks(num_threads);
+    int num_querys = querys.size();
+    int n_query_per_threads = (num_querys + num_threads - 1) / num_threads;
+    int start = 0;
+    for (int i = 0; i < num_threads; ++i) {
+        int size = min(n_query_per_threads, num_querys - start);
+        int end = start + size;
+        topk_tasks[i] = new TopkTask(
+                ctx, i, num_threads, start, end,
+                doc_stat_offset, querys, query_idx, d_docs, d_doc_lens,
+                n_docs_pad, indices);
+        start = end;
+    }
+
+    pool.run_task(topk_tasks);
+    pool.wait();
+#endif
+
 t.stop();
 }
